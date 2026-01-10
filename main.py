@@ -45,7 +45,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create keyboard with Open Wallet button that opens mini app
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://your-miniapp-url.com"})]
+        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.pages.dev/dashboard"})]
     ])
     
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
@@ -67,7 +67,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create keyboard with Open Wallet button
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://your-miniapp-url.com"})]
+        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.pages.dev/dashboard"})]
     ])
     
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
@@ -93,29 +93,34 @@ async def send_transaction_notification_async(data: dict):
     try:
         # Determine emoji based on transaction type and status
         if status.lower() == "success":
-            if t_type.lower() == "credit":
+            if t_type.lower() == "send":
+                status_emoji = "✅"
+                type_emoji = ""
+            elif t_type.lower() == "api":
+                status_emoji = "✅"
+                type_emoji = "🏧"
+            elif t_type.lower() == "addfund":
                 status_emoji = "✅"
                 type_emoji = "📥"
-            else:
+            elif t_type.lower() == "withdraw":
                 status_emoji = "✅"
                 type_emoji = "📤"
+            else:
+                status_emoji = "✅"
+                type_emoji = "⭐"
         else:
             status_emoji = "❌"
             type_emoji = "⚠️"
         
         # Formatted message with HTML
         msg = (
-            f"━━━━━━━━━━━━━━━━\n"
-            f"💰 <b>Transaction Alert!</b>\n"
-            f"━━━━━━━━━━━━━━━━\n\n"
+            f"💰 <b>Transaction Alert!</b>\n\n"
             f"{type_emoji} <b>Type:</b> {t_type}\n"
             f"💵 <b>Amount:</b> ₹{amount}\n"
             f"{status_emoji} <b>Status:</b> {status}\n"
             f"👤 <b>Sender:</b> {sender}\n"
             f"💬 <b>Comment:</b> {comment}\n\n"
-            f"━━━━━━━━━━━━━━━━\n"
             f"💼 <b>New Balance:</b> ₹{balance}\n"
-            f"━━━━━━━━━━━━━━━━\n\n"
         )
         
         # Inline button to open mini app
