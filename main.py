@@ -37,26 +37,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
     user = update.effective_user
     msg = (
-        f"👋 Hello {user.first_name}!\n\n"
-        "Welcome to Xeo Wallet Bot.\n"
+        f"👋 <b>Hello {user.first_name}!</b>\n\n"
+        "Welcome to <b>Xeo Wallet Bot</b>. 💼\n"
         "You will receive notifications for all your wallet transactions here.\n\n"
         "Use /help to see available commands."
     )
-    await update.message.reply_text(msg)
+    
+    # Create keyboard with Open Wallet button that opens mini app
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://your-miniapp-url.com"})]
+    ])
+    
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
     logger.info(f"User {user.id} started the bot")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /help command"""
     msg = (
-        "📝 Available Commands:\n"
-        "/start - Start the bot\n"
-        "/help - Show this help message\n\n"
-        "📡 Channel: t.me/Xeo_Wallet\n"
-        "👨‍💻 Developer: @Gamenter\n"
-        "🤖 Bot: @XeoWalletBot\n\n"
-        "All wallet transactions will be notified automatically here."
+        "📝 <b>Available Commands:</b>\n\n"
+        "• /start - Start the bot\n"
+        "• /help - Show this help message\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "📡 <b>Channel:</b> @Xeo_Wallet\n"
+        "👨‍💻 <b>Developer:</b> @Gamenter\n"
+        "🤖 <b>Bot:</b> @XeoWalletBot\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "💡 All wallet transactions will be notified automatically here."
     )
-    await update.message.reply_text(msg)
+    
+    # Create keyboard with Open Wallet button
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://your-miniapp-url.com"})]
+    ])
+    
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
     logger.info(f"User {update.effective_user.id} requested help")
 
 # =====================
@@ -77,26 +91,43 @@ async def send_transaction_notification_async(data: dict):
         return False
     
     try:
-        # Simple message without MarkdownV2 to avoid parsing issues
+        # Determine emoji based on transaction type and status
+        if status.lower() == "success":
+            if t_type.lower() == "credit":
+                status_emoji = "✅"
+                type_emoji = "📥"
+            else:
+                status_emoji = "✅"
+                type_emoji = "📤"
+        else:
+            status_emoji = "❌"
+            type_emoji = "⚠️"
+        
+        # Formatted message with HTML
         msg = (
-            f"💰 Transaction Alert!\n\n"
-            f"Type: {t_type}\n"
-            f"Amount: ₹{amount}\n"
-            f"Status: {status}\n"
-            f"Sender: {sender}\n"
-            f"Comment: {comment}\n"
-            f"New Balance: ₹{balance}"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💰 <b>Transaction Alert!</b>\n"
+            f"━━━━━━━━━━━━━━━━\n\n"
+            f"{type_emoji} <b>Type:</b> {t_type}\n"
+            f"💵 <b>Amount:</b> ₹{amount}\n"
+            f"{status_emoji} <b>Status:</b> {status}\n"
+            f"👤 <b>Sender:</b> {sender}\n"
+            f"💬 <b>Comment:</b> {comment}\n\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💼 <b>New Balance:</b> ₹{balance}\n"
+            f"━━━━━━━━━━━━━━━━\n\n"
         )
         
-        # Inline button to view wallet
+        # Inline button to open mini app
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💼 View Wallet", url=f"https://t.me/XeoWalletBot?start=wallet_{user_id}")]
+            [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.pages.dev/dashboard"})]
         ])
         
         # Send the message using the shared bot instance
         await bot_instance.send_message(
             chat_id=user_id,
             text=msg,
+            parse_mode="HTML",
             reply_markup=keyboard
         )
         logger.info(f"Transaction notification sent to user {user_id}")
