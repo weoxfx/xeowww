@@ -7,13 +7,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # =====================
 # Environment Variables
 # =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")        # Telegram bot token
-BOT_USERNAME = "XeoWalletBot"             # bot username without @
+BOT_TOKEN = os.getenv("BOT_TOKEN")        # Your bot token
+BOT_USERNAME = "XeoWalletBot"             # Bot username without @
 
 app = Flask(__name__)
 
 # =====================
-# Telegram Commands
+# Telegram Handlers
 # =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -37,7 +37,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 # =====================
-# Telegram Application (webhook-only)
+# Telegram Application
 # =====================
 application = Application.builder().token(BOT_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
@@ -48,7 +48,8 @@ application.add_handler(CommandHandler("help", help_cmd))
 # =====================
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
     asyncio.run(application.process_update(update))
     return "ok", 200
 
@@ -60,16 +61,17 @@ def notify_transaction():
     data = request.json
     try:
         user_id = data.get("user_id")
-        t_type = data.get("type")
-        amount = data.get("amount")
-        status = data.get("status")
+        t_type = data.get("type", "N/A")
+        amount = data.get("amount", 0)
+        status = data.get("status", "Unknown")
         sender = data.get("sender", "N/A")
         comment = data.get("comment", "No comment")
-        balance = data.get("balance")
+        balance = data.get("balance", 0)
 
         if not user_id:
             return jsonify({"error": "user_id missing"}), 400
 
+        # Format transaction message
         msg = (
             f"💰 *Transaction Alert!*\n\n"
             f"*Type:* {t_type}\n"
@@ -80,11 +82,20 @@ def notify_transaction():
             f"*New Balance:* ₹{balance}"
         )
 
+        # Mini app button
+        bot_url = f"tg://resolve?domain={BOT_USERNAME}&start=mini"
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("💼 View Wallet", url=f"tg://resolve?domain={BOT_USERNAME}&start=mini")]]
+            [[InlineKeyboardButton("💼 View Wallet", url=bot_url)]]
         )
 
-        asyncio.run(application.bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown", reply_markup=keyboard))
+        # Send notification
+        asyncio.run(application.bot.send_message(
+            chat_id=user_id,
+            text=msg,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        ))
+
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
