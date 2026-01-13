@@ -45,7 +45,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create keyboard with Open Wallet button that opens mini app
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.pages.dev/dashboard"})]
+        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.vercel.app/dashboard"})]
     ])
     
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
@@ -67,7 +67,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create keyboard with Open Wallet button
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.pages.dev/dashboard"})]
+        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.vercel.app/dashboard"})]
     ])
     
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
@@ -100,10 +100,10 @@ async def send_transaction_notification_async(data: dict):
     try:
         # Determine emoji based on transaction type and status
         if status.lower() == "success":
-            if t_type.lower() == "send":
+            if t_type.lower() == "send_credit":
                 status_emoji = "✅"
-                type_emoji = ""
-            elif t_type.lower() == "api":
+                type_emoji = "🏧"
+            elif t_type.lower() == "api_debit":
                 status_emoji = "✅"
                 type_emoji = "🏧"
             elif t_type.lower() == "addfund":
@@ -132,7 +132,7 @@ async def send_transaction_notification_async(data: dict):
         
         # Inline button to open mini app
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.pages.dev/dashboard"})]
+            [InlineKeyboardButton("💼 Open Wallet", web_app={"url": "https://xeow.vercel.app/dashboard"})]
         ])
         
         # Send the message using the shared bot instance
