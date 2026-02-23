@@ -292,8 +292,11 @@ async def run_bot_async():
 
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.run_polling()
 
+    # ✅ IMPORTANT FIX
+    await telegram_app.run_polling(
+        stop_signals=None  # ← THIS FIXES YOUR ERROR
+    )
 
 def run_telegram_bot():
     asyncio.run(run_bot_async())
