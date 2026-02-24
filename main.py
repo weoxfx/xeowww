@@ -30,7 +30,7 @@ MINIAPP_URL = "https://xeowallet.vercel.app"
 app = Flask(__name__)
 
 # =====================
-# Bot State (mutable dict avoids global scoping issues with gunicorn)
+# Bot State
 # =====================
 _state = {
     "loop": None,
@@ -47,7 +47,10 @@ def bot_is_ready():
 
 
 def wait_for_bot(timeout=30):
-    return _state["ready"].wait(timeout=timeout)
+    logger.info(f"[WAIT] Waiting for bot ready event (timeout={timeout}s)...")
+    result = _state["ready"].wait(timeout=timeout)
+    logger.info(f"[WAIT] Bot ready event result: {result}, loop={_state['loop']}, app={_state['app']}")
+    return result
 
 # =========================================================
 # 🧠 CHANNEL CHECK LOGIC
@@ -210,7 +213,10 @@ def home():
     return jsonify({
         "status": "online",
         "service": "Xeo Wallet Bot",
-        "bot_ready": bot_is_ready()
+        "bot_ready": bot_is_ready(),
+        "event_set": _state["ready"].is_set(),
+        "loop_set": _state["loop"] is not None,
+        "app_set": _state["app"] is not None,
     })
 
 
@@ -279,38 +285,47 @@ def check_channels():
 # =========================================================
 
 async def run_bot_async():
+    logger.info("[BOT] Building application...")
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("id", id_cmd))
 
+    logger.info("[BOT] Initializing...")
     await telegram_app.initialize()
+
+    logger.info("[BOT] Deleting webhook...")
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+
+    logger.info("[BOT] Starting...")
     await telegram_app.start()
 
-    # Store in mutable dict — visible to all threads immediately
+    logger.info("[BOT] Setting state and signaling ready...")
     _state["app"] = telegram_app
     _state["loop"] = asyncio.get_running_loop()
     _state["ready"].set()
 
-    logger.info("✅ Bot is ready and polling.")
+    logger.info(f"✅ [BOT] Ready! event={_state['ready'].is_set()} loop={_state['loop']} app={_state['app']}")
 
     try:
         await telegram_app.updater.start_polling(drop_pending_updates=True)
+        logger.info("[BOT] Polling started.")
         stop_event = asyncio.Event()
         await stop_event.wait()
 
     finally:
-        logger.info("Bot shutting down...")
+        logger.info("[BOT] Shutting down...")
         await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
-        logger.info("Bot shut down cleanly.")
+        logger.info("[BOT] Shutdown complete.")
 
 
 def run_telegram_bot():
+    logger.info("[THREAD] Bot thread started.")
     asyncio.run(run_bot_async())
+    logger.info("[THREAD] Bot thread ended.")
 
 # =========================================================
 # 🔴 GRACEFUL SHUTDOWN
@@ -326,14 +341,18 @@ def shutdown_handler(signum, frame):
 atexit.register(lambda: logger.info("Process exiting."))
 
 # =========================================================
-# 🏁 START BOT THREAD (module-level so gunicorn picks it up)
+# 🏁 START BOT THREAD
 # =========================================================
+
+logger.info("[MAIN] Module loaded, starting bot thread...")
 
 signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
 bot_thread = Thread(target=run_telegram_bot, daemon=True)
 bot_thread.start()
+
+logger.info("[MAIN] Bot thread launched.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
