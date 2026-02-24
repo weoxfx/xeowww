@@ -62,22 +62,31 @@ async def check_user_in_channel(user_id: int, channel: str):
             chat_id=channel,
             user_id=user_id
         )
+
         if member.status in ["member", "administrator", "creator"]:
             return "joined"
+        
+        # left, kicked, restricted = not joined
         return "not_joined"
 
     except Exception as e:
         err = str(e).lower()
+
         if (
             "chat not found" in err
             or "not enough rights" in err
             or "have no rights" in err
             or "forbidden" in err
+            or "bot is not a member" in err
+            or "user not found" in err
         ):
-            logger.warning(f"Bot lacks access to {channel}")
+            logger.warning(f"Bot lacks access to {channel}: {e}")
             return "bot_not_admin"
+
+        # For any other error (e.g. user never started bot),
+        # treat as not_joined so they are prompted to join
         logger.warning(f"Channel check failed for {channel}: {e}")
-        return "error"
+        return "not_joined"
 
 
 async def verify_user_channels(user_id: int, channels: list):
