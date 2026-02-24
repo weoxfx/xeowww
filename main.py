@@ -5,7 +5,7 @@ import asyncio
 import os
 import logging
 import signal
-import time
+import threading
 import atexit
 from threading import Thread
 
@@ -35,24 +35,19 @@ app = Flask(__name__)
 bot_instance = Bot(token=BOT_TOKEN)
 telegram_app = None
 bot_loop = None
+bot_ready_event = threading.Event()
 
 # =========================================================
 # 🛡️ BOT READY GUARD
 # =========================================================
 
 def bot_is_ready():
-    """Returns True if the bot and its event loop are fully initialized."""
-    return telegram_app is not None and bot_loop is not None and bot_loop.is_running()
+    return bot_ready_event.is_set() and bot_loop is not None
 
 
 def wait_for_bot(timeout=30):
-    """Wait up to `timeout` seconds for the bot to be ready."""
-    start = time.time()
-    while not bot_is_ready():
-        if time.time() - start > timeout:
-            return False
-        time.sleep(0.5)
-    return True
+    """Block until bot is ready or timeout expires. Returns True if ready."""
+    return bot_ready_event.wait(timeout=timeout)
 
 # =========================================================
 # 🧠 CHANNEL CHECK LOGIC
@@ -317,8 +312,6 @@ async def run_bot_async():
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("id", id_cmd))
 
-    bot_loop = asyncio.get_running_loop()
-
     await telegram_app.initialize()
 
     # Clear any existing webhook or polling conflict
@@ -326,10 +319,15 @@ async def run_bot_async():
 
     await telegram_app.start()
 
+    # Set loop and signal ready BEFORE entering polling
+    bot_loop = asyncio.get_running_loop()
+    bot_ready_event.set()
+    logger.info("✅ Bot is ready and polling.")
+
     try:
         await telegram_app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Bot is running and polling.")
 
+        # Keep running forever
         stop_event = asyncio.Event()
         await stop_event.wait()
 
