@@ -361,13 +361,13 @@ atexit.register(lambda: logger.info("Process exiting."))
 # 🏁 MAIN
 # =========================================================
 
+# Start bot thread when module is loaded (works with both gunicorn and direct run)
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
+
+bot_thread = Thread(target=run_telegram_bot, daemon=True)
+bot_thread.start()
+
 if __name__ == "__main__":
-    # FIX: Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-
-    bot_thread = Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
-
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
