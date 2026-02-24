@@ -5,6 +5,7 @@ import asyncio
 import os
 import logging
 import signal
+import time
 import atexit
 from threading import Thread
 
@@ -33,7 +34,7 @@ app = Flask(__name__)
 # =====================
 bot_instance = Bot(token=BOT_TOKEN)
 telegram_app = None
-bot_loop = None  # FIX: Store the bot's running event loop for thread-safe submissions
+bot_loop = None
 
 # =========================================================
 # 🛡️ BOT READY GUARD
@@ -43,8 +44,18 @@ def bot_is_ready():
     """Returns True if the bot and its event loop are fully initialized."""
     return telegram_app is not None and bot_loop is not None and bot_loop.is_running()
 
+
+def wait_for_bot(timeout=30):
+    """Wait up to `timeout` seconds for the bot to be ready."""
+    start = time.time()
+    while not bot_is_ready():
+        if time.time() - start > timeout:
+            return False
+        time.sleep(0.5)
+    return True
+
 # =========================================================
-# 🧠 CHANNEL CHECK LOGIC (with bot admin detection)
+# 🧠 CHANNEL CHECK LOGIC
 # =========================================================
 
 async def check_user_in_channel(user_id: int, channel: str):
@@ -204,7 +215,6 @@ async def send_transaction_notification_async(data: dict):
 
 
 def send_transaction_notification(data: dict):
-    # FIX: Reuse the bot's running event loop instead of creating a new one per thread
     if not bot_is_ready():
         logger.error("Bot not ready, cannot send notification")
         return False
@@ -234,9 +244,8 @@ def home():
 
 @app.route("/notify_transaction", methods=["POST"])
 def notify_transaction():
-    # FIX: Guard against requests arriving before the bot is initialized
-    if not bot_is_ready():
-        return jsonify({"error": "Bot not ready yet, try again shortly"}), 503
+    if not wait_for_bot():
+        return jsonify({"error": "Bot failed to start"}), 503
 
     data = request.json
 
@@ -258,13 +267,10 @@ def notify_transaction():
     return jsonify({"ok": True})
 
 
-# 🔥 FORCE-SUB CHECK (LIFAFA)
-
 @app.route("/check_channels", methods=["POST"])
 def check_channels():
-    # FIX: Guard against requests arriving before the bot is initialized
-    if not bot_is_ready():
-        return jsonify({"error": "Bot not ready yet, try again shortly"}), 503
+    if not wait_for_bot():
+        return jsonify({"error": "Bot failed to start"}), 503
 
     data = request.json
     user_id = data.get("user_id")
@@ -274,14 +280,12 @@ def check_channels():
         return jsonify({"error": "Missing user_id or channels"}), 400
 
     try:
-        # FIX: Reuse the bot's running event loop instead of creating a new one
         future = asyncio.run_coroutine_threadsafe(
             verify_user_channels(user_id, channels),
             bot_loop
         )
         not_joined, bot_missing = future.result(timeout=15)
 
-        # 🚨 bot not admin case
         if bot_missing:
             return jsonify({
                 "ok": False,
@@ -290,7 +294,6 @@ def check_channels():
                 "message": "Bot is not admin in some channels"
             })
 
-        # ✅ normal result
         return jsonify({
             "ok": True,
             "joined": len(not_joined) == 0,
@@ -314,21 +317,19 @@ async def run_bot_async():
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("id", id_cmd))
 
-    logger.info("Bot starting...")
-
-    # FIX: Capture the running loop so Flask threads can submit coroutines to it
     bot_loop = asyncio.get_running_loop()
 
-    # FIX: Proper init/start/stop lifecycle with try/finally for graceful shutdown
     await telegram_app.initialize()
+
+    # Clear any existing webhook or polling conflict
+    await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+
     await telegram_app.start()
 
     try:
-        # FIX: drop_pending_updates=True prevents conflicts if a webhook was previously set
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         logger.info("Bot is running and polling.")
 
-        # Keep the coroutine alive until the loop is stopped externally
         stop_event = asyncio.Event()
         await stop_event.wait()
 
@@ -343,13 +344,11 @@ async def run_bot_async():
 def run_telegram_bot():
     asyncio.run(run_bot_async())
 
-
 # =========================================================
 # 🔴 GRACEFUL SHUTDOWN
 # =========================================================
 
 def shutdown_handler(signum, frame):
-    """FIX: Handle SIGTERM/SIGINT for graceful shutdown of Flask + bot."""
     logger.info(f"Received signal {signum}, shutting down...")
     if bot_loop and bot_loop.is_running():
         bot_loop.call_soon_threadsafe(bot_loop.stop)
@@ -358,10 +357,9 @@ def shutdown_handler(signum, frame):
 atexit.register(lambda: logger.info("Process exiting."))
 
 # =========================================================
-# 🏁 MAIN
+# 🏁 START BOT THREAD (runs on module import, works with gunicorn)
 # =========================================================
 
-# Start bot thread when module is loaded (works with both gunicorn and direct run)
 signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
