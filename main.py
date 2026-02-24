@@ -30,50 +30,41 @@ MINIAPP_URL = "https://xeowallet.vercel.app"
 app = Flask(__name__)
 
 # =====================
-# Global Bot & Loop
+# Bot State (mutable dict avoids global scoping issues with gunicorn)
 # =====================
-bot_instance = Bot(token=BOT_TOKEN)
-telegram_app = None
-bot_loop = None
-bot_ready_event = threading.Event()
+_state = {
+    "loop": None,
+    "app": None,
+    "ready": threading.Event(),
+}
 
 # =========================================================
-# 🛡️ BOT READY GUARD
+# 🛡️ BOT READY HELPERS
 # =========================================================
 
 def bot_is_ready():
-    return bot_ready_event.is_set() and bot_loop is not None
+    return _state["ready"].is_set() and _state["loop"] is not None
 
 
 def wait_for_bot(timeout=30):
-    """Block until bot is ready or timeout expires. Returns True if ready."""
-    return bot_ready_event.wait(timeout=timeout)
+    return _state["ready"].wait(timeout=timeout)
 
 # =========================================================
 # 🧠 CHANNEL CHECK LOGIC
 # =========================================================
 
 async def check_user_in_channel(user_id: int, channel: str):
-    """
-    Returns:
-        "joined"
-        "not_joined"
-        "bot_not_admin"
-        "error"
-    """
     try:
-        member = await bot_instance.get_chat_member(
+        member = await _state["app"].bot.get_chat_member(
             chat_id=channel,
             user_id=user_id
         )
-
         if member.status in ["member", "administrator", "creator"]:
             return "joined"
         return "not_joined"
 
     except Exception as e:
         err = str(e).lower()
-
         if (
             "chat not found" in err
             or "not enough rights" in err
@@ -82,7 +73,6 @@ async def check_user_in_channel(user_id: int, channel: str):
         ):
             logger.warning(f"Bot lacks access to {channel}")
             return "bot_not_admin"
-
         logger.warning(f"Channel check failed for {channel}: {e}")
         return "error"
 
@@ -90,15 +80,12 @@ async def check_user_in_channel(user_id: int, channel: str):
 async def verify_user_channels(user_id: int, channels: list):
     not_joined = []
     bot_missing = []
-
     for ch in channels:
         result = await check_user_in_channel(user_id, ch)
-
         if result == "not_joined":
             not_joined.append(ch)
         elif result == "bot_not_admin":
             bot_missing.append(ch)
-
     return not_joined, bot_missing
 
 # =========================================================
@@ -107,18 +94,15 @@ async def verify_user_channels(user_id: int, channels: list):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
     msg = (
         f"👋 <b>Hello {user.first_name}!</b>\n\n"
         "Welcome to <b>Xeo Wallet Bot</b>. 💼\n"
         "You will receive notifications for all your wallet transactions here.\n\n"
         "Use /help to see available commands."
     )
-
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})]
     ])
-
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
 
 
@@ -135,11 +119,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━\n\n"
         "💡 All wallet transactions will be notified automatically here."
     )
-
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})]
     ])
-
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
 
 
@@ -195,13 +177,12 @@ async def send_transaction_notification_async(data: dict):
             [InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})]
         ])
 
-        await bot_instance.send_message(
+        await _state["app"].bot.send_message(
             chat_id=user_id,
             text=msg,
             parse_mode="HTML",
             reply_markup=keyboard
         )
-
         return True
 
     except Exception as e:
@@ -210,14 +191,10 @@ async def send_transaction_notification_async(data: dict):
 
 
 def send_transaction_notification(data: dict):
-    if not bot_is_ready():
-        logger.error("Bot not ready, cannot send notification")
-        return False
-
     try:
         future = asyncio.run_coroutine_threadsafe(
             send_transaction_notification_async(data),
-            bot_loop
+            _state["loop"]
         )
         return future.result(timeout=15)
     except Exception as e:
@@ -243,13 +220,11 @@ def notify_transaction():
         return jsonify({"error": "Bot failed to start"}), 503
 
     data = request.json
-
     if not data:
         return jsonify({"error": "No data provided"}), 400
 
     required_fields = ["user_id", "type", "amount", "status"]
     missing = [f for f in required_fields if f not in data]
-
     if missing:
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
 
@@ -277,7 +252,7 @@ def check_channels():
     try:
         future = asyncio.run_coroutine_threadsafe(
             verify_user_channels(user_id, channels),
-            bot_loop
+            _state["loop"]
         )
         not_joined, bot_missing = future.result(timeout=15)
 
@@ -304,8 +279,6 @@ def check_channels():
 # =========================================================
 
 async def run_bot_async():
-    global telegram_app, bot_loop
-
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
@@ -313,21 +286,18 @@ async def run_bot_async():
     telegram_app.add_handler(CommandHandler("id", id_cmd))
 
     await telegram_app.initialize()
-
-    # Clear any existing webhook or polling conflict
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
-
     await telegram_app.start()
 
-    # Set loop and signal ready BEFORE entering polling
-    bot_loop = asyncio.get_running_loop()
-    bot_ready_event.set()
+    # Store in mutable dict — visible to all threads immediately
+    _state["app"] = telegram_app
+    _state["loop"] = asyncio.get_running_loop()
+    _state["ready"].set()
+
     logger.info("✅ Bot is ready and polling.")
 
     try:
         await telegram_app.updater.start_polling(drop_pending_updates=True)
-
-        # Keep running forever
         stop_event = asyncio.Event()
         await stop_event.wait()
 
@@ -348,14 +318,15 @@ def run_telegram_bot():
 
 def shutdown_handler(signum, frame):
     logger.info(f"Received signal {signum}, shutting down...")
-    if bot_loop and bot_loop.is_running():
-        bot_loop.call_soon_threadsafe(bot_loop.stop)
+    loop = _state.get("loop")
+    if loop and loop.is_running():
+        loop.call_soon_threadsafe(loop.stop)
     os._exit(0)
 
 atexit.register(lambda: logger.info("Process exiting."))
 
 # =========================================================
-# 🏁 START BOT THREAD (runs on module import, works with gunicorn)
+# 🏁 START BOT THREAD (module-level so gunicorn picks it up)
 # =========================================================
 
 signal.signal(signal.SIGTERM, shutdown_handler)
