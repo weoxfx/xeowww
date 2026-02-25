@@ -49,29 +49,61 @@ def bot_is_ready():
 def wait_for_bot(timeout=30):
     logger.info(f"[WAIT] Waiting for bot ready event (timeout={timeout}s)...")
     result = _state["ready"].wait(timeout=timeout)
-    logger.info(f"[WAIT] Bot ready event result: {result}, loop={_state['loop']}, app={_state['app']}")
+    logger.info(f"[WAIT] Bot ready event result: {result}")
     return result
 
 # =========================================================
 # 🧠 CHANNEL CHECK LOGIC
 # =========================================================
 
+def resolve_channel_id(channel: str) -> str:
+    """
+    Resolves a channel string to a usable chat_id for get_chat_member.
+    - Private invite links (https://t.me/+xxx) → cannot be resolved, return None
+    - Numeric IDs (-100xxxxxxxxx) → use directly
+    - @username → use directly
+    """
+    ch = channel.strip()
+
+    # Already a numeric chat ID (e.g. -1001234567890)
+    if ch.lstrip('-').isdigit():
+        return ch
+
+    # Public @username or plain username
+    if ch.startswith('@'):
+        return ch
+    if not ch.startswith('http') and not ch.startswith('t.me'):
+        return f"@{ch}"
+
+    # t.me/username (public)
+    if 't.me/' in ch and '/+' not in ch:
+        username = ch.split('t.me/')[1].strip('/')
+        return f"@{username}"
+
+    # Private invite link — cannot check membership via invite link
+    # Must use numeric chat ID instead
+    return None
+
+
 async def check_user_in_channel(user_id: int, channel: str):
+    chat_id = resolve_channel_id(channel)
+
+    if chat_id is None:
+        # Private invite link with no chat ID — we can't check this
+        logger.warning(f"Cannot check private invite link: {channel}. Use numeric chat ID instead.")
+        return "bot_not_admin"
+
     try:
         member = await _state["app"].bot.get_chat_member(
-            chat_id=channel,
+            chat_id=chat_id,
             user_id=user_id
         )
-
         if member.status in ["member", "administrator", "creator"]:
             return "joined"
-        
-        # left, kicked, restricted = not joined
         return "not_joined"
 
     except Exception as e:
         err = str(e).lower()
-
         if (
             "chat not found" in err
             or "not enough rights" in err
@@ -82,9 +114,6 @@ async def check_user_in_channel(user_id: int, channel: str):
         ):
             logger.warning(f"Bot lacks access to {channel}: {e}")
             return "bot_not_admin"
-
-        # For any other error (e.g. user never started bot),
-        # treat as not_joined so they are prompted to join
         logger.warning(f"Channel check failed for {channel}: {e}")
         return "not_joined"
 
@@ -99,6 +128,17 @@ async def verify_user_channels(user_id: int, channels: list):
         elif result == "bot_not_admin":
             bot_missing.append(ch)
     return not_joined, bot_missing
+
+
+async def get_chat_id_async(invite_link: str):
+    """Try to get chat info from an invite link (bot must already be in the chat)."""
+    try:
+        # This only works if the bot is already a member
+        chat = await _state["app"].bot.get_chat(invite_link)
+        return {"ok": True, "chat_id": chat.id, "title": chat.title}
+    except Exception as e:
+        logger.error(f"get_chat_id failed for {invite_link}: {e}")
+        return {"ok": False, "error": str(e)}
 
 # =========================================================
 # 🤖 TELEGRAM COMMANDS
@@ -123,7 +163,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 <b>Available Commands:</b>\n\n"
         "• /start - Start the bot\n"
         "• /help - Show this help message\n"
-        "• /id - Get your Telegram ID\n\n"
+        "• /id - Get your Telegram ID\n"
+        "• /chatid - Get a channel's numeric chat ID (forward any message from the channel)\n\n"
         "━━━━━━━━━━━━━━━━\n"
         "📡 Channel: @Xeo_Wallet\n"
         "👨‍💻 Developer: @Gamenter\n"
@@ -142,6 +183,27 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>{update.effective_user.id}</b>",
         parse_mode="HTML"
     )
+
+
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    If the user forwards a message from a channel, return the channel's chat ID.
+    Useful for setting up private channel verification.
+    """
+    msg = update.message
+    if msg.forward_from_chat:
+        chat = msg.forward_from_chat
+        await msg.reply_text(
+            f"📢 <b>Channel:</b> {chat.title}\n"
+            f"🆔 <b>Chat ID:</b> <code>{chat.id}</code>\n\n"
+            f"Use this numeric ID when adding a private channel in Xeo Wallet.",
+            parse_mode="HTML"
+        )
+    else:
+        await msg.reply_text(
+            "Forward any message from your private channel to get its Chat ID.",
+            parse_mode="HTML"
+        )
 
 # =========================================================
 # 💰 TRANSACTION NOTIFICATIONS
@@ -168,6 +230,12 @@ async def send_transaction_notification_async(data: dict):
                 type_emoji = "📥"
             elif t_type.lower() == "withdraw":
                 type_emoji = "📤"
+            elif t_type.lower() == "lifafa_win":
+                type_emoji = "🎉"
+            elif t_type.lower() == "lifafa_create":
+                type_emoji = "🧧"
+            elif t_type.lower() == "lifafa_refund":
+                type_emoji = "↩️"
             else:
                 type_emoji = "⭐"
             status_emoji = "✅"
@@ -266,7 +334,7 @@ def check_channels():
 
     try:
         future = asyncio.run_coroutine_threadsafe(
-            verify_user_channels(user_id, channels),
+            verify_user_channels(int(user_id), channels),
             _state["loop"]
         )
         not_joined, bot_missing = future.result(timeout=15)
@@ -289,6 +357,32 @@ def check_channels():
         logger.error(f"Channel verify error: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/resolve_chat_id", methods=["POST"])
+def resolve_chat_id():
+    """
+    Helper endpoint: given an invite link, returns the numeric chat ID.
+    Bot must already be a member of the private channel.
+    Usage: POST { "invite_link": "https://t.me/+xxxxxxxx" }
+    """
+    if not wait_for_bot():
+        return jsonify({"error": "Bot failed to start"}), 503
+
+    data = request.json
+    invite_link = data.get("invite_link")
+    if not invite_link:
+        return jsonify({"error": "Missing invite_link"}), 400
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            get_chat_id_async(invite_link),
+            _state["loop"]
+        )
+        result = future.result(timeout=15)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # =========================================================
 # 🚀 RUN TELEGRAM BOT
 # =========================================================
@@ -300,6 +394,7 @@ async def run_bot_async():
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("id", id_cmd))
+    telegram_app.add_handler(CommandHandler("chatid", chatid_cmd))
 
     logger.info("[BOT] Initializing...")
     await telegram_app.initialize()
@@ -315,7 +410,7 @@ async def run_bot_async():
     _state["loop"] = asyncio.get_running_loop()
     _state["ready"].set()
 
-    logger.info(f"✅ [BOT] Ready! event={_state['ready'].is_set()} loop={_state['loop']} app={_state['app']}")
+    logger.info(f"✅ [BOT] Ready!")
 
     try:
         await telegram_app.updater.start_polling(drop_pending_updates=True)
