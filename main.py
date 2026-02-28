@@ -619,15 +619,18 @@ def supabase_rpc(func_name, params):
 
 def create_new_round():
     """Create a new betting round in Supabase."""
+    from datetime import datetime, timezone, timedelta
+    ends_at = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
     data = supabase_request("POST", "game_rounds", {
         "game": "big_small",
         "status": "betting",
+        "ends_at": ends_at,
     })
     if data and len(data) > 0:
         round_id = data[0]["id"]
-        logger.info(f"[GAME] New round created: {round_id}")
+        logger.info(f"[GAME] New round created: {round_id} ends_at: {ends_at}")
         return round_id
-    logger.error("[GAME] Failed to create round")
+    logger.error(f"[GAME] Failed to create round, response: {data}")
     return None
 
 def resolve_round(round_id):
@@ -648,7 +651,7 @@ def game_round_loop():
     """
     Infinite loop that manages game rounds:
     - 10s betting window
-    - 2s result display
+    - 3s result display
     - repeat
     """
     logger.info("[GAME] Round manager starting, waiting for bot to be ready...")
@@ -661,25 +664,27 @@ def game_round_loop():
             # Create new round
             round_id = create_new_round()
             if not round_id:
-                time.sleep(5)
+                logger.error("[GAME] Failed to create round, retrying in 3s")
+                time.sleep(3)
                 continue
 
             _round_state["current_round_id"] = round_id
+            logger.info(f"[GAME] Betting open for 10s (round {round_id})")
 
             # Betting window: 10 seconds
-            logger.info(f"[GAME] Betting open for 10s (round {round_id})")
             time.sleep(10)
 
-            # Resolve round
+            # Resolve round immediately
+            logger.info(f"[GAME] Resolving round {round_id}...")
             result = resolve_round(round_id)
-            logger.info(f"[GAME] Result: {result}")
+            logger.info(f"[GAME] Round resolved: {result}")
 
-            # Result display: 3 seconds
+            # Result display: 3 seconds then next round
             time.sleep(3)
 
         except Exception as e:
             logger.error(f"[GAME] Round loop error: {e}")
-            time.sleep(5)
+            time.sleep(3)
 
 # =========================================================
 # 🔴 GRACEFUL SHUTDOWN
