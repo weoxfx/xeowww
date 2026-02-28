@@ -1,6 +1,7 @@
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import asyncio
 import os
 import logging
@@ -35,6 +36,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 # Flask App Setup
 # =====================
 app = Flask(__name__)
+CORS(app, origins=["https://xeowallet.vercel.app", "http://localhost:5173", "http://localhost:3000"])
 
 # =====================
 # Bot State
