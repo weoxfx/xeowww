@@ -553,6 +553,134 @@ def run_telegram_bot():
     asyncio.run(run_bot_async())
     logger.info("[THREAD] Bot thread ended.")
 
+
+# =========================================================
+# 🎮 GAME ROUND MANAGER
+# =========================================================
+import random
+import json as _json
+import urllib.request
+import urllib.error
+
+_round_state = {
+    "current_round_id": None,
+    "running": False,
+}
+
+def supabase_request(method, path, data=None):
+    """Make a request to Supabase REST API."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.error("Supabase env vars missing")
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    payload = _json.dumps(data).encode() if data else None
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method=method,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Prefer": "return=representation",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode()
+            return _json.loads(body) if body else []
+    except Exception as e:
+        logger.error(f"Supabase request failed ({method} {path}): {e}")
+        return None
+
+def supabase_rpc(func_name, params):
+    """Call a Supabase RPC function."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/rpc/{func_name}"
+    payload = _json.dumps(params).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode()
+            return _json.loads(body) if body else None
+    except Exception as e:
+        logger.error(f"Supabase RPC {func_name} failed: {e}")
+        return None
+
+def create_new_round():
+    """Create a new betting round in Supabase."""
+    data = supabase_request("POST", "game_rounds", {
+        "game": "big_small",
+        "status": "betting",
+    })
+    if data and len(data) > 0:
+        round_id = data[0]["id"]
+        logger.info(f"[GAME] New round created: {round_id}")
+        return round_id
+    logger.error("[GAME] Failed to create round")
+    return None
+
+def resolve_round(round_id):
+    """Pick a result and resolve all bets for this round."""
+    result = random.choice(["big", "small"])
+    logger.info(f"[GAME] Resolving round {round_id} -> {result}")
+    data = supabase_rpc("resolve_round", {
+        "p_round_id": round_id,
+        "p_result": result,
+    })
+    if data and data.get("ok"):
+        logger.info(f"[GAME] Round {round_id} resolved: {result}")
+    else:
+        logger.error(f"[GAME] Failed to resolve round {round_id}: {data}")
+    return result
+
+def game_round_loop():
+    """
+    Infinite loop that manages game rounds:
+    - 10s betting window
+    - 2s result display
+    - repeat
+    """
+    logger.info("[GAME] Round manager starting, waiting for bot to be ready...")
+    _state["ready"].wait(timeout=60)
+    logger.info("[GAME] Round manager started!")
+    _round_state["running"] = True
+
+    while _round_state["running"]:
+        try:
+            # Create new round
+            round_id = create_new_round()
+            if not round_id:
+                time.sleep(5)
+                continue
+
+            _round_state["current_round_id"] = round_id
+
+            # Betting window: 10 seconds
+            logger.info(f"[GAME] Betting open for 10s (round {round_id})")
+            time.sleep(10)
+
+            # Resolve round
+            result = resolve_round(round_id)
+            logger.info(f"[GAME] Result: {result}")
+
+            # Result display: 3 seconds
+            time.sleep(3)
+
+        except Exception as e:
+            logger.error(f"[GAME] Round loop error: {e}")
+            time.sleep(5)
+
 # =========================================================
 # 🔴 GRACEFUL SHUTDOWN
 # =========================================================
@@ -575,6 +703,11 @@ signal.signal(signal.SIGINT, shutdown_handler)
 bot_thread = Thread(target=run_telegram_bot, daemon=True)
 bot_thread.start()
 logger.info("[MAIN] Bot thread launched.")
+
+# Start game round manager
+game_thread = Thread(target=game_round_loop, daemon=True)
+game_thread.start()
+logger.info("[MAIN] Game round manager launched.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
