@@ -7,6 +7,8 @@ import logging
 import signal
 import threading
 import atexit
+import secrets
+import time
 from threading import Thread
 
 # =====================
@@ -23,6 +25,11 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
 
 MINIAPP_URL = "https://xeowallet.vercel.app"
+ADMIN_TELEGRAM_ID = "6186511950"
+
+# Supabase config for confirming telegram connections
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 # =====================
 # Flask App Setup
@@ -38,13 +45,24 @@ _state = {
     "ready": threading.Event(),
 }
 
+# =====================
+# Pending connect codes
+# { code: { user_id: str, xid: str, created_at: float } }
+# =====================
+_pending_connects = {}
+
+# Cleanup codes older than 10 minutes
+def cleanup_old_codes():
+    now = time.time()
+    expired = [k for k, v in _pending_connects.items() if now - v["created_at"] > 600]
+    for k in expired:
+        del _pending_connects[k]
+
 # =========================================================
 # 🛡️ BOT READY HELPERS
 # =========================================================
-
 def bot_is_ready():
     return _state["ready"].is_set() and _state["loop"] is not None
-
 
 def wait_for_bot(timeout=30):
     logger.info(f"[WAIT] Waiting for bot ready event (timeout={timeout}s)...")
@@ -55,44 +73,24 @@ def wait_for_bot(timeout=30):
 # =========================================================
 # 🧠 CHANNEL CHECK LOGIC
 # =========================================================
-
 def resolve_channel_id(channel: str) -> str:
-    """
-    Resolves a channel string to a usable chat_id for get_chat_member.
-    - Private invite links (https://t.me/+xxx) → cannot be resolved, return None
-    - Numeric IDs (-100xxxxxxxxx) → use directly
-    - @username → use directly
-    """
     ch = channel.strip()
-
-    # Already a numeric chat ID (e.g. -1001234567890)
     if ch.lstrip('-').isdigit():
         return ch
-
-    # Public @username or plain username
     if ch.startswith('@'):
         return ch
     if not ch.startswith('http') and not ch.startswith('t.me'):
         return f"@{ch}"
-
-    # t.me/username (public)
     if 't.me/' in ch and '/+' not in ch:
         username = ch.split('t.me/')[1].strip('/')
         return f"@{username}"
-
-    # Private invite link — cannot check membership via invite link
-    # Must use numeric chat ID instead
     return None
-
 
 async def check_user_in_channel(user_id: int, channel: str):
     chat_id = resolve_channel_id(channel)
-
     if chat_id is None:
-        # Private invite link with no chat ID — we can't check this
         logger.warning(f"Cannot check private invite link: {channel}. Use numeric chat ID instead.")
         return "bot_not_admin"
-
     try:
         member = await _state["app"].bot.get_chat_member(
             chat_id=chat_id,
@@ -101,22 +99,20 @@ async def check_user_in_channel(user_id: int, channel: str):
         if member.status in ["member", "administrator", "creator"]:
             return "joined"
         return "not_joined"
-
     except Exception as e:
         err = str(e).lower()
         if (
-            "chat not found" in err
-            or "not enough rights" in err
-            or "have no rights" in err
-            or "forbidden" in err
-            or "bot is not a member" in err
-            or "user not found" in err
+            "chat not found" in err or
+            "not enough rights" in err or
+            "have no rights" in err or
+            "forbidden" in err or
+            "bot is not a member" in err or
+            "user not found" in err
         ):
             logger.warning(f"Bot lacks access to {channel}: {e}")
             return "bot_not_admin"
         logger.warning(f"Channel check failed for {channel}: {e}")
         return "not_joined"
-
 
 async def verify_user_channels(user_id: int, channels: list):
     not_joined = []
@@ -129,11 +125,8 @@ async def verify_user_channels(user_id: int, channels: list):
             bot_missing.append(ch)
     return not_joined, bot_missing
 
-
 async def get_chat_id_async(invite_link: str):
-    """Try to get chat info from an invite link (bot must already be in the chat)."""
     try:
-        # This only works if the bot is already a member
         chat = await _state["app"].bot.get_chat(invite_link)
         return {"ok": True, "chat_id": chat.id, "title": chat.title}
     except Exception as e:
@@ -141,26 +134,101 @@ async def get_chat_id_async(invite_link: str):
         return {"ok": False, "error": str(e)}
 
 # =========================================================
+# 💾 SAVE TELEGRAM ID TO SUPABASE
+# =========================================================
+async def save_telegram_id_to_supabase(user_id: str, telegram_id: int):
+    """Save telegram_id to profiles table via Supabase REST API."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.error("Supabase env vars not set, cannot save telegram_id")
+        return False
+    try:
+        import urllib.request
+        import json as _json
+        url = f"{SUPABASE_URL}/rest/v1/profiles?user_id=eq.{user_id}"
+        payload = _json.dumps({"telegram_id": str(telegram_id)}).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="PATCH",
+            headers={
+                "Content-Type": "application/json",
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Prefer": "return=minimal"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info(f"Saved telegram_id {telegram_id} for user {user_id}, status: {resp.status}")
+            return resp.status in [200, 204]
+    except Exception as e:
+        logger.error(f"Failed to save telegram_id: {e}")
+        return False
+
+# =========================================================
 # 🤖 TELEGRAM COMMANDS
 # =========================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    args = context.args  # payload after /start
+
+    # ── Handle connect flow ──────────────────────────────
+    if args and len(args) > 0:
+        code = args[0]
+        cleanup_old_codes()
+
+        if code in _pending_connects:
+            pending = _pending_connects.pop(code)
+            website_user_id = pending["user_id"]
+            xid = pending.get("xid", "User")
+
+            # Save telegram_id to Supabase
+            saved = await save_telegram_id_to_supabase(website_user_id, user.id)
+
+            if saved:
+                await update.message.reply_text(
+                    f"✅ Connected Successfully!\n\n"
+                    f"👤 Account: {xid}\n"
+                    f"🆔 Telegram ID: {user.id}\n\n"
+                    f"You'll now receive alerts for:\n"
+                    f"• 💰 Transactions\n"
+                    f"• 📥 Fund request updates\n"
+                    f"• 📤 Withdrawal updates\n"
+                    f"• 🎉 Lifafa wins\n\n"
+                    f"Welcome to Xeo Wallet! 🚀",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+                    ]])
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Connection failed. Please try again from the wallet.",
+                    parse_mode="HTML"
+                )
+            return
+        else:
+            await update.message.reply_text(
+                "⚠️ This connect link has expired or already been used.\n"
+                "Please generate a new one from your wallet dashboard.",
+                parse_mode="HTML"
+            )
+            return
+
+    # ── Normal /start ────────────────────────────────────
     msg = (
-        f"👋 <b>Hello {user.first_name}!</b>\n\n"
-        "Welcome to <b>Xeo Wallet Bot</b>. 💼\n"
+        f"👋 Hello {user.first_name}!\n\n"
+        "Welcome to Xeo Wallet Bot. 💼\n"
         "You will receive notifications for all your wallet transactions here.\n\n"
         "Use /help to see available commands."
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+    ]])
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "📝 <b>Available Commands:</b>\n\n"
+        "📝 Available Commands:\n\n"
         "• /start - Start the bot\n"
         "• /help - Show this help message\n"
         "• /id - Get your Telegram ID\n"
@@ -172,30 +240,24 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━\n\n"
         "💡 All wallet transactions will be notified automatically here."
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+    ]])
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
-
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"<b>{update.effective_user.id}</b>",
+        f"{update.effective_user.id}",
         parse_mode="HTML"
     )
 
-
 async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    If the user forwards a message from a channel, return the channel's chat ID.
-    Useful for setting up private channel verification.
-    """
     msg = update.message
     if msg.forward_from_chat:
         chat = msg.forward_from_chat
         await msg.reply_text(
-            f"📢 <b>Channel:</b> {chat.title}\n"
-            f"🆔 <b>Chat ID:</b> <code>{chat.id}</code>\n\n"
+            f"📢 Channel: {chat.title}\n"
+            f"🆔 Chat ID: `{chat.id}`\n\n"
             f"Use this numeric ID when adding a private channel in Xeo Wallet.",
             parse_mode="HTML"
         )
@@ -208,7 +270,6 @@ async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # 💰 TRANSACTION NOTIFICATIONS
 # =========================================================
-
 async def send_transaction_notification_async(data: dict):
     user_id = data.get("user_id")
     t_type = data.get("type", "Unknown")
@@ -244,18 +305,18 @@ async def send_transaction_notification_async(data: dict):
             type_emoji = "⚠️"
 
         msg = (
-            f"💰 <b>Transaction Alert!</b>\n\n"
-            f"{type_emoji} <b>Type:</b> {t_type}\n"
-            f"💵 <b>Amount:</b> ₹{amount}\n"
-            f"{status_emoji} <b>Status:</b> {status}\n"
-            f"👤 <b>Sender:</b> {sender}\n"
-            f"💬 <b>Comment:</b> {comment}\n\n"
-            f"💼 <b>New Balance:</b> ₹{balance}"
+            f"💰 Transaction Alert!\n\n"
+            f"{type_emoji} Type: {t_type}\n"
+            f"💵 Amount: ₹{amount}\n"
+            f"{status_emoji} Status: {status}\n"
+            f"👤 Sender: {sender}\n"
+            f"💬 Comment: {comment}\n\n"
+            f"💼 New Balance: ₹{balance}"
         )
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})]
-        ])
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+        ]])
 
         await _state["app"].bot.send_message(
             chat_id=user_id,
@@ -264,11 +325,9 @@ async def send_transaction_notification_async(data: dict):
             reply_markup=keyboard
         )
         return True
-
     except Exception as e:
         logger.error(f"Error sending notification: {e}")
         return False
-
 
 def send_transaction_notification(data: dict):
     try:
@@ -282,9 +341,37 @@ def send_transaction_notification(data: dict):
         return False
 
 # =========================================================
+# 📣 ADMIN NOTIFICATION
+# =========================================================
+async def send_admin_message_async(message: str):
+    try:
+        await _state["app"].bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=message,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔧 Admin Panel", url=f"{MINIAPP_URL}/admin")
+            ]])
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Error sending admin message: {e}")
+        return False
+
+def send_admin_message(message: str):
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            send_admin_message_async(message),
+            _state["loop"]
+        )
+        return future.result(timeout=15)
+    except Exception as e:
+        logger.error(f"Failed to send admin message: {e}")
+        return False
+
+# =========================================================
 # 🌐 FLASK ROUTES
 # =========================================================
-
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -295,7 +382,6 @@ def home():
         "loop_set": _state["loop"] is not None,
         "app_set": _state["app"] is not None,
     })
-
 
 @app.route("/notify_transaction", methods=["POST"])
 def notify_transaction():
@@ -316,9 +402,57 @@ def notify_transaction():
         args=(data,),
         daemon=True
     ).start()
-
     return jsonify({"ok": True})
 
+@app.route("/admin", methods=["POST"])
+def admin_alert():
+    """
+    Send a message directly to the admin Telegram.
+    Usage: POST { "message": "New add fund request!" }
+    """
+    if not wait_for_bot():
+        return jsonify({"error": "Bot failed to start"}), 503
+
+    data = request.json
+    if not data or not data.get("message"):
+        return jsonify({"error": "Missing message"}), 400
+
+    message = data["message"]
+
+    Thread(
+        target=send_admin_message,
+        args=(message,),
+        daemon=True
+    ).start()
+    return jsonify({"ok": True})
+
+@app.route("/check-id", methods=["POST"])
+def check_id():
+    """
+    Generate a unique connect code and return a t.me link.
+    Usage: POST { "user_id": "...", "xid": "..." }
+    Returns: { "link": "https://t.me/XeoWalletBot?start=CODE", "code": "CODE" }
+    """
+    if not wait_for_bot():
+        return jsonify({"error": "Bot failed to start"}), 503
+
+    data = request.json
+    if not data or not data.get("user_id"):
+        return jsonify({"error": "Missing user_id"}), 400
+
+    cleanup_old_codes()
+
+    # Generate a unique code
+    code = secrets.token_urlsafe(16)
+    _pending_connects[code] = {
+        "user_id": data["user_id"],
+        "xid": data.get("xid", "User"),
+        "created_at": time.time()
+    }
+
+    link = f"https://t.me/XeoWalletBot?start={code}"
+    logger.info(f"Generated connect link for user {data['user_id']}: {link}")
+    return jsonify({"ok": True, "link": link, "code": code})
 
 @app.route("/check_channels", methods=["POST"])
 def check_channels():
@@ -352,19 +486,12 @@ def check_channels():
             "joined": len(not_joined) == 0,
             "missing_channels": not_joined
         })
-
     except Exception as e:
         logger.error(f"Channel verify error: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/resolve_chat_id", methods=["POST"])
 def resolve_chat_id():
-    """
-    Helper endpoint: given an invite link, returns the numeric chat ID.
-    Bot must already be a member of the private channel.
-    Usage: POST { "invite_link": "https://t.me/+xxxxxxxx" }
-    """
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
 
@@ -386,11 +513,9 @@ def resolve_chat_id():
 # =========================================================
 # 🚀 RUN TELEGRAM BOT
 # =========================================================
-
 async def run_bot_async():
     logger.info("[BOT] Building application...")
     telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("id", id_cmd))
@@ -398,10 +523,8 @@ async def run_bot_async():
 
     logger.info("[BOT] Initializing...")
     await telegram_app.initialize()
-
     logger.info("[BOT] Deleting webhook...")
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
-
     logger.info("[BOT] Starting...")
     await telegram_app.start()
 
@@ -409,7 +532,6 @@ async def run_bot_async():
     _state["app"] = telegram_app
     _state["loop"] = asyncio.get_running_loop()
     _state["ready"].set()
-
     logger.info(f"✅ [BOT] Ready!")
 
     try:
@@ -417,14 +539,12 @@ async def run_bot_async():
         logger.info("[BOT] Polling started.")
         stop_event = asyncio.Event()
         await stop_event.wait()
-
     finally:
         logger.info("[BOT] Shutting down...")
         await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
         logger.info("[BOT] Shutdown complete.")
-
 
 def run_telegram_bot():
     logger.info("[THREAD] Bot thread started.")
@@ -434,7 +554,6 @@ def run_telegram_bot():
 # =========================================================
 # 🔴 GRACEFUL SHUTDOWN
 # =========================================================
-
 def shutdown_handler(signum, frame):
     logger.info(f"Received signal {signum}, shutting down...")
     loop = _state.get("loop")
@@ -447,15 +566,12 @@ atexit.register(lambda: logger.info("Process exiting."))
 # =========================================================
 # 🏁 START BOT THREAD
 # =========================================================
-
 logger.info("[MAIN] Module loaded, starting bot thread...")
-
 signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
 
 bot_thread = Thread(target=run_telegram_bot, daemon=True)
 bot_thread.start()
-
 logger.info("[MAIN] Bot thread launched.")
 
 if __name__ == "__main__":
