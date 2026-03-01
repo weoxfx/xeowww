@@ -712,6 +712,28 @@ def notify_transaction():
     Thread(target=send_transaction_notification, args=(data,), daemon=True).start()
     return jsonify({"ok": True})
 
+@app.route("/test_email", methods=["GET"])
+def test_email():
+    """Test Gmail connection and fetch recent emails."""
+    try:
+        emails = fetch_recent_famapp_emails(since_minutes=60)
+        results = []
+        for e in emails:
+            amount, sender = parse_payment_email(e["subject"], e["body"])
+            results.append({
+                "subject": e["subject"],
+                "parsed_amount": amount,
+                "parsed_sender": sender,
+            })
+        return jsonify({
+            "ok": True,
+            "emails_found": len(emails),
+            "active_sessions": list(_deposit_sessions.values()),
+            "parsed": results,
+        })
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex)})
+
 @app.route("/admin", methods=["POST"])
 def admin_alert():
     if not wait_for_bot():
