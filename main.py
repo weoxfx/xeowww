@@ -455,6 +455,87 @@ def email_watcher_loop():
         time.sleep(30)
 
 # =========================================================
+# 💤 INACTIVITY FEE MANAGER
+# =========================================================
+async def send_inactivity_warning_async(telegram_id: str, username: str, balance: float, days_inactive: int):
+    try:
+        fee = round(balance * 0.30, 2) if balance > 0 else 10
+        await _state["app"].bot.send_message(
+            chat_id=telegram_id,
+            text=(
+                f"⚠️ Inactivity Warning!\n\n"
+                f"👤 Hi {username},\n"
+                f"You've been inactive for {days_inactive} days.\n\n"
+                f"💸 In {30 - days_inactive} days, a maintenance fee of "
+                f"₹{fee} will be deducted from your balance.\n\n"
+                f"💼 Current Balance: ₹{balance:.2f}\n\n"
+                f"Stay active to avoid the fee — just make any transaction! 🚀"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+            ]])
+        )
+    except Exception as e:
+        logger.error(f"Failed to send inactivity warning to {telegram_id}: {e}")
+
+def inactivity_fee_loop():
+    logger.info("[INACTIVITY] Manager starting...")
+    _state["ready"].wait(timeout=60)
+    logger.info("[INACTIVITY] Manager started!")
+
+    while True:
+        try:
+            logger.info("[INACTIVITY] Running daily check...")
+
+            data = supabase_request("GET", "profiles", params={
+                "select": "user_id,username,balance,telegram_id,last_active_at",
+                "is_frozen": "eq.false",
+                "is_banned": "eq.false",
+                "telegram_id": "not.is.null",
+            })
+
+            if data:
+                now = datetime.now(timezone.utc)
+                for user in data:
+                    if not user.get("last_active_at"):
+                        continue
+                    last_active = datetime.fromisoformat(
+                        user["last_active_at"].replace("Z", "+00:00")
+                    )
+                    days_inactive = (now - last_active).days
+
+                    if days_inactive == 25 and user.get("telegram_id"):
+                        future = asyncio.run_coroutine_threadsafe(
+                            send_inactivity_warning_async(
+                                user["telegram_id"],
+                                user["username"],
+                                float(user["balance"] or 0),
+                                days_inactive
+                            ),
+                            _state["loop"]
+                        )
+                        try:
+                            future.result(timeout=15)
+                            logger.info(f"[INACTIVITY] Warned {user['username']}")
+                        except Exception as e:
+                            logger.error(f"Warning failed: {e}")
+
+            result = supabase_rpc("charge_inactivity_fees", {})
+            if result:
+                logger.info(f"[INACTIVITY] Charged {result.get('charged_users', 0)} users, total ₹{result.get('total_charged', 0)}")
+                if result.get("charged_users", 0) > 0:
+                    send_admin_message(
+                        f"💤 Inactivity Fees Collected\n\n"
+                        f"👥 Users charged: {result['charged_users']}\n"
+                        f"💰 Total collected: ₹{result['total_charged']}"
+                    )
+
+        except Exception as e:
+            logger.error(f"[INACTIVITY] Error: {e}")
+
+        time.sleep(86400)  # Run every 24 hours
+
+# =========================================================
 # 🧠 CHANNEL CHECK LOGIC
 # =========================================================
 def resolve_channel_id(channel: str) -> str:
@@ -976,6 +1057,10 @@ logger.info("[MAIN] Bot thread launched.")
 game_thread = Thread(target=game_round_loop, daemon=True)
 game_thread.start()
 logger.info("[MAIN] Game round manager launched.")
+
+inactivity_thread = Thread(target=inactivity_fee_loop, daemon=True)
+inactivity_thread.start()
+logger.info("[MAIN] Inactivity fee manager launched.")
 
 email_thread = Thread(target=email_watcher_loop, daemon=True)
 email_thread.start()
