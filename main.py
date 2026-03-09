@@ -65,9 +65,13 @@ _pending_connects = {}
 
 # =====================
 # Active deposit sessions
-# { request_id: { user_id, xid, amount, telegram_id, expires_at, matched } }
 # =====================
 _deposit_sessions = {}
+
+# =====================
+# Pending transfers
+# =====================
+_pending_transfers = {}
 
 def cleanup_old_codes():
     now = time.time()
@@ -163,22 +167,17 @@ async def save_telegram_id_to_supabase(user_id: str, telegram_id: int):
 # 📧 GMAIL WATCHER
 # =========================================================
 def fetch_recent_famapp_emails(since_minutes=6):
-    """Fetch recent payment emails from FamApp."""
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         mail.select("inbox")
-
-        # Search emails from FamApp in the last `since_minutes` minutes
         since_date = (datetime.now() - timedelta(minutes=since_minutes)).strftime("%d-%b-%Y")
         _, message_ids = mail.search(None, f'(FROM "{FAMAPP_SENDER}" SINCE "{since_date}" UNSEEN)')
-
         emails = []
         for msg_id in message_ids[0].split():
             _, msg_data = mail.fetch(msg_id, "(RFC822)")
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
-
             subject = ""
             raw_subject = msg.get("Subject", "")
             decoded = decode_header(raw_subject)
@@ -187,7 +186,6 @@ def fetch_recent_famapp_emails(since_minutes=6):
                     subject += part.decode(enc or "utf-8", errors="ignore")
                 else:
                     subject += part
-
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -197,66 +195,44 @@ def fetch_recent_famapp_emails(since_minutes=6):
                         body += part.get_payload(decode=True).decode("utf-8", errors="ignore")
             else:
                 body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-
-            emails.append({
-                "id": msg_id,
-                "subject": subject,
-                "body": body,
-            })
-
+            emails.append({"id": msg_id, "subject": subject, "body": body})
         mail.logout()
         return emails
-
     except Exception as e:
         logger.error(f"Gmail fetch error: {e}")
         return []
 
 def parse_payment_email(subject, body):
-    """Extract amount and sender name from FamApp email."""
-    # Subject: "You received ₹10.0 in your FamX account"
     amount = None
     sender_name = None
-
-    # Extract amount from subject
     amt_match = re.search(r'₹([\d.]+)', subject)
     if not amt_match:
         amt_match = re.search(r'Rs\.?\s*([\d.]+)', subject, re.IGNORECASE)
     if amt_match:
         amount = float(amt_match.group(1))
-
-    # Extract sender from body: "from KUSUM BHAGAT"
     sender_match = re.search(r'from\s+([A-Z][A-Z\s]+)', body)
     if sender_match:
         sender_name = sender_match.group(1).strip()
-
     return amount, sender_name
 
 def check_emails_for_sessions():
-    """Check Gmail for payments matching active deposit sessions."""
     if not _deposit_sessions:
         return
-
     emails = fetch_recent_famapp_emails(since_minutes=6)
     if not emails:
         return
-
     for email_data in emails:
         amount, sender_name = parse_payment_email(email_data["subject"], email_data["body"])
         if not amount:
             continue
-
         logger.info(f"[EMAIL] Found payment: ₹{amount} from {sender_name}")
-
-        # Match to a pending session by amount
         for request_id, session in list(_deposit_sessions.items()):
             if session.get("matched"):
                 continue
-            if abs(float(session["amount"]) - amount) < 0.5:  # within 0.5 rupee tolerance
+            if abs(float(session["amount"]) - amount) < 0.5:
                 session["matched"] = True
                 session["sender_name"] = sender_name or "Unknown"
                 logger.info(f"[EMAIL] Matched session {request_id} for ₹{amount}")
-
-                # Send admin group approval message
                 future = asyncio.run_coroutine_threadsafe(
                     send_admin_approval_request(request_id, session, amount, sender_name),
                     _state["loop"]
@@ -268,10 +244,8 @@ def check_emails_for_sessions():
                 break
 
 async def send_admin_approval_request(request_id, session, amount, sender_name):
-    """Send approval request to admin group with inline buttons."""
     bonus = round(amount * 0.01, 2)
     total = amount + bonus
-
     msg = (
         f"💰 Payment Detected!\n\n"
         f"👤 User: {session['xid']}\n"
@@ -281,69 +255,52 @@ async def send_admin_approval_request(request_id, session, amount, sender_name):
         f"✅ Total to credit: ₹{total}\n\n"
         f"Approve this deposit?"
     )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{request_id}"),
-            InlineKeyboardButton("❌ Decline", callback_data=f"decline_{request_id}"),
-        ]
-    ])
-
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{request_id}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"decline_{request_id}"),
+    ]])
     await _state["app"].bot.send_message(
-        chat_id=ADMIN_GROUP_ID,
-        text=msg,
-        parse_mode="HTML",
-        reply_markup=keyboard
+        chat_id=ADMIN_GROUP_ID, text=msg, parse_mode="HTML", reply_markup=keyboard
     )
 
 # =========================================================
-# 🔘 CALLBACK HANDLER (Approve / Decline)
+# 🔘 CALLBACK HANDLER
 # =========================================================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
     if not data:
         return
-
     if data.startswith("approve_"):
-        request_id = data.replace("approve_", "")
-        await handle_approve(query, request_id)
+        await handle_approve(query, data.replace("approve_", ""))
     elif data.startswith("decline_"):
-        request_id = data.replace("decline_", "")
-        await handle_decline(query, request_id)
+        await handle_decline(query, data.replace("decline_", ""))
+    elif data.startswith("transfer_confirm_"):
+        await handle_transfer_confirm(query, data.replace("transfer_confirm_", ""))
+    elif data.startswith("transfer_cancel_"):
+        await handle_transfer_cancel(query, data.replace("transfer_cancel_", ""))
 
 async def handle_approve(query, request_id):
     session = _deposit_sessions.get(request_id)
     if not session:
         await query.edit_message_text("⚠️ Session expired or not found.")
         return
-
     amount = float(session["amount"])
     bonus = round(amount * 0.01, 2)
     total = amount + bonus
     user_id = session["user_id"]
     xid = session["xid"]
     telegram_id = session.get("telegram_id")
-
     try:
-        # 1. Get current balance
         profiles = supabase_request("GET", "profiles", params={"user_id": f"eq.{user_id}", "select": "balance"})
         if not profiles:
             await query.edit_message_text("⚠️ User profile not found.")
             return
-
         current_balance = float(profiles[0]["balance"])
         new_balance = current_balance + total
-
-        # 2. Update balance
         supabase_request("PATCH", f"profiles?user_id=eq.{user_id}", {"balance": new_balance})
-
-        # 3. Update add_fund_request status
         supabase_request("PATCH", f"add_fund_requests?id=eq.{request_id}", {"status": "approved"})
-
-        # 4. Insert transaction
         supabase_request("POST", "transactions", {
             "user_id": user_id,
             "type": "addfund",
@@ -351,8 +308,6 @@ async def handle_approve(query, request_id):
             "status": "completed",
             "description": f"Add fund approved ₹{amount} + ₹{bonus} bonus",
         })
-
-        # 5. Notify user via Telegram
         if telegram_id:
             try:
                 await _state["app"].bot.send_message(
@@ -371,18 +326,13 @@ async def handle_approve(query, request_id):
                 )
             except Exception as e:
                 logger.error(f"Failed to notify user: {e}")
-
-        # 6. Update admin message
         await query.edit_message_text(
             f"✅ Approved!\n\n"
             f"👤 {xid}\n"
             f"💵 ₹{total} credited (₹{amount} + ₹{bonus} bonus)\n"
             f"💼 New Balance: ₹{new_balance:.2f}"
         )
-
-        # 7. Remove session
         _deposit_sessions.pop(request_id, None)
-
     except Exception as e:
         logger.error(f"Approve error: {e}")
         await query.edit_message_text(f"⚠️ Error approving: {e}")
@@ -392,15 +342,10 @@ async def handle_decline(query, request_id):
     if not session:
         await query.edit_message_text("⚠️ Session expired or not found.")
         return
-
     xid = session["xid"]
     amount = session["amount"]
     telegram_id = session.get("telegram_id")
-
-    # Update request status
     supabase_request("PATCH", f"add_fund_requests?id=eq.{request_id}", {"status": "declined"})
-
-    # Notify user
     if telegram_id:
         try:
             await _state["app"].bot.send_message(
@@ -417,27 +362,228 @@ async def handle_decline(query, request_id):
             )
         except Exception as e:
             logger.error(f"Failed to notify user of decline: {e}")
-
     await query.edit_message_text(
         f"❌ Declined\n\n"
         f"👤 {xid}\n"
         f"💵 ₹{amount} — request declined"
     )
-
     _deposit_sessions.pop(request_id, None)
+
+# =========================================================
+# 💸 /send COMMAND
+# =========================================================
+async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: /send <XID/Mobile/Username> <Amount>\n\n"
+            "Examples:\n"
+            "• /send john@x 50\n"
+            "• /send 9876543210 100\n"
+            "• /send johndoe 25"
+        )
+        return
+
+    target = args[0].strip()
+    try:
+        amount = float(args[1].strip())
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+        return
+
+    if amount < 1:
+        await update.message.reply_text("❌ Minimum send amount is ₹1.")
+        return
+
+    # Check sender is linked
+    sender_profiles = supabase_request("GET", "profiles", params={
+        "telegram_id": f"eq.{user.id}",
+        "select": "user_id,username,xid,balance,is_frozen,is_banned",
+    })
+
+    if not sender_profiles:
+        await update.message.reply_text(
+            "❌ Your Telegram is not linked to any XeoWallet account.\n\n"
+            "Go to your wallet and link your Telegram first.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+            ]])
+        )
+        return
+
+    sender = sender_profiles[0]
+
+    if sender.get("is_frozen") or sender.get("is_banned"):
+        await update.message.reply_text("❌ Your account is restricted.")
+        return
+
+    if float(sender["balance"]) < amount:
+        await update.message.reply_text(
+            f"❌ Insufficient balance.\n\n"
+            f"💼 Your balance: ₹{float(sender['balance']):.2f}\n"
+            f"💸 Amount: ₹{amount:.2f}"
+        )
+        return
+
+    # Find recipient by xid, mobile, or username
+    recipient_profiles = supabase_request("GET", "profiles", params={
+        "or": f"(xid.eq.{target},mobile.eq.{target},username.eq.{target})",
+        "select": "user_id,username,xid,balance,telegram_id,is_frozen,is_banned",
+    })
+
+    if not recipient_profiles:
+        await update.message.reply_text(f"❌ User '{target}' not found.")
+        return
+
+    recipient = recipient_profiles[0]
+
+    if recipient["user_id"] == sender["user_id"]:
+        await update.message.reply_text("❌ You cannot send money to yourself.")
+        return
+
+    if recipient.get("is_frozen") or recipient.get("is_banned"):
+        await update.message.reply_text("❌ Recipient account is restricted.")
+        return
+
+    # Store pending transfer
+    transfer_code = secrets.token_urlsafe(8)
+    _pending_transfers[transfer_code] = {
+        "sender_user_id": sender["user_id"],
+        "sender_telegram_id": str(user.id),
+        "sender_xid": sender["xid"],
+        "sender_username": sender["username"],
+        "recipient_user_id": recipient["user_id"],
+        "recipient_xid": recipient["xid"],
+        "recipient_username": recipient["username"],
+        "recipient_telegram_id": recipient.get("telegram_id"),
+        "amount": amount,
+        "created_at": time.time(),
+    }
+
+    await update.message.reply_text(
+        f"💸 Confirm Transfer\n\n"
+        f"👤 To: {recipient['username']} ({recipient['xid']})\n"
+        f"💵 Amount: ₹{amount:.2f}\n"
+        f"💼 Your balance after: ₹{float(sender['balance']) - amount:.2f}\n\n"
+        f"Are you sure?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data=f"transfer_confirm_{transfer_code}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"transfer_cancel_{transfer_code}"),
+        ]])
+    )
+
+async def handle_transfer_confirm(query, transfer_code):
+    transfer = _pending_transfers.get(transfer_code)
+    if not transfer:
+        await query.edit_message_text("⚠️ Transfer expired. Please try again.")
+        return
+
+    if str(query.from_user.id) != transfer["sender_telegram_id"]:
+        await query.answer("❌ This is not your transfer.", show_alert=True)
+        return
+
+    amount = transfer["amount"]
+
+    try:
+        # Get fresh sender balance
+        sender_data = supabase_request("GET", "profiles", params={
+            "user_id": f"eq.{transfer['sender_user_id']}",
+            "select": "balance",
+        })
+        if not sender_data or float(sender_data[0]["balance"]) < amount:
+            await query.edit_message_text("❌ Insufficient balance.")
+            _pending_transfers.pop(transfer_code, None)
+            return
+
+        sender_balance = float(sender_data[0]["balance"])
+
+        # Get fresh recipient balance
+        recipient_data = supabase_request("GET", "profiles", params={
+            "user_id": f"eq.{transfer['recipient_user_id']}",
+            "select": "balance",
+        })
+        recipient_balance = float(recipient_data[0]["balance"])
+
+        # Deduct sender
+        supabase_request("PATCH", f"profiles?user_id=eq.{transfer['sender_user_id']}",
+            {"balance": sender_balance - amount})
+
+        # Credit recipient
+        supabase_request("PATCH", f"profiles?user_id=eq.{transfer['recipient_user_id']}",
+            {"balance": recipient_balance + amount})
+
+        # Record sender transaction
+        supabase_request("POST", "transactions", {
+            "user_id": transfer["sender_user_id"],
+            "type": "send",
+            "amount": amount,
+            "status": "completed",
+            "description": f"Sent ₹{amount} to {transfer['recipient_xid']} via Telegram",
+        })
+
+        # Record recipient transaction
+        supabase_request("POST", "transactions", {
+            "user_id": transfer["recipient_user_id"],
+            "type": "receive",
+            "amount": amount,
+            "status": "completed",
+            "description": f"Received ₹{amount} from {transfer['sender_xid']} via Telegram",
+        })
+
+        # Confirm to sender
+        await query.edit_message_text(
+            f"✅ Transfer Successful!\n\n"
+            f"💸 Sent ₹{amount:.2f} to {transfer['recipient_username']} ({transfer['recipient_xid']})\n"
+            f"💼 New Balance: ₹{sender_balance - amount:.2f}"
+        )
+
+        # Notify recipient if connected
+        if transfer.get("recipient_telegram_id"):
+            try:
+                await _state["app"].bot.send_message(
+                    chat_id=transfer["recipient_telegram_id"],
+                    text=(
+                        f"💰 Money Received!\n\n"
+                        f"👤 From: {transfer['sender_username']} ({transfer['sender_xid']})\n"
+                        f"💵 Amount: ₹{amount:.2f}\n"
+                        f"💼 New Balance: ₹{recipient_balance + amount:.2f}"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+                    ]])
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify recipient: {e}")
+
+        _pending_transfers.pop(transfer_code, None)
+
+    except Exception as e:
+        logger.error(f"Transfer error: {e}")
+        await query.edit_message_text(f"❌ Transfer failed: {e}")
+
+async def handle_transfer_cancel(query, transfer_code):
+    transfer = _pending_transfers.get(transfer_code)
+    if not transfer:
+        await query.edit_message_text("⚠️ Transfer already expired.")
+        return
+    if str(query.from_user.id) != transfer["sender_telegram_id"]:
+        await query.answer("❌ This is not your transfer.", show_alert=True)
+        return
+    _pending_transfers.pop(transfer_code, None)
+    await query.edit_message_text("❌ Transfer cancelled.")
 
 # =========================================================
 # ⏱️ EMAIL WATCHER LOOP
 # =========================================================
 def email_watcher_loop():
-    """Check Gmail every 30 seconds for matching payments."""
     logger.info("[EMAIL] Watcher starting...")
     _state["ready"].wait(timeout=60)
     logger.info("[EMAIL] Watcher started!")
 
     while True:
         try:
-            # Clean expired sessions (older than 6 minutes)
             now = time.time()
             expired = [k for k, v in list(_deposit_sessions.items())
                       if now > v.get("expires_at", 0) and not v.get("matched")]
@@ -445,7 +591,12 @@ def email_watcher_loop():
                 logger.info(f"[EMAIL] Session {k} expired without match")
                 _deposit_sessions.pop(k, None)
 
-            # Check emails
+            # Clean expired transfers (older than 5 minutes)
+            expired_transfers = [k for k, v in list(_pending_transfers.items())
+                                if time.time() - v["created_at"] > 300]
+            for k in expired_transfers:
+                _pending_transfers.pop(k, None)
+
             if _deposit_sessions:
                 check_emails_for_sessions()
 
@@ -486,7 +637,6 @@ def inactivity_fee_loop():
     while True:
         try:
             logger.info("[INACTIVITY] Running daily check...")
-
             data = supabase_request("GET", "profiles", params={
                 "select": "user_id,username,balance,telegram_id,last_active_at",
                 "is_frozen": "eq.false",
@@ -533,7 +683,7 @@ def inactivity_fee_loop():
         except Exception as e:
             logger.error(f"[INACTIVITY] Error: {e}")
 
-        time.sleep(86400)  # Run every 24 hours
+        time.sleep(86400)
 
 # =========================================================
 # 🧠 CHANNEL CHECK LOGIC
@@ -594,14 +744,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and len(args) > 0:
         code = args[0]
         cleanup_old_codes()
-
         if code in _pending_connects:
             pending = _pending_connects.pop(code)
             website_user_id = pending["user_id"]
             xid = pending.get("xid", "User")
-
             saved = await save_telegram_id_to_supabase(website_user_id, user.id)
-
             if saved:
                 await update.message.reply_text(
                     f"✅ Connected Successfully!\n\n"
@@ -630,10 +777,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "You will receive notifications for all your wallet transactions here.\n\n"
         "Use /help to see available commands."
     )
-    keyboard = InlineKeyboardMarkup([[
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
-    ]])
-    await update.message.reply_text(msg, reply_markup=keyboard)
+    ]]))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -641,7 +787,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /start - Start the bot\n"
         "• /help - Show this help message\n"
         "• /id - Get your Telegram ID\n"
-        "• /chatid - Get a channel's numeric chat ID\n\n"
+        "• /chatid - Get a channel's numeric chat ID\n"
+        "• /send <XID/Mobile/Username> <Amount> - Send money\n"
+        "• /balance - Check your wallet balance\n\n"
         "━━━━━━━━━━━━━━━━\n"
         "📡 Channel: @Xeo_Wallet\n"
         "👨‍💻 Developer: @Gamenter\n"
@@ -649,10 +797,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━\n\n"
         "💡 All wallet transactions will be notified automatically here."
     )
-    keyboard = InlineKeyboardMarkup([[
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
-    ]])
-    await update.message.reply_text(msg, reply_markup=keyboard)
+    ]]))
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"{update.effective_user.id}")
@@ -669,6 +816,31 @@ async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await msg.reply_text("Forward any message from your private channel to get its Chat ID.")
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    profiles = supabase_request("GET", "profiles", params={
+        "telegram_id": f"eq.{user.id}",
+        "select": "username,xid,balance",
+    })
+    if not profiles:
+        await update.message.reply_text(
+            "❌ Your Telegram is not linked to any XeoWallet account.\n\n"
+            "Go to your wallet and link your Telegram first.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+            ]])
+        )
+        return
+    profile = profiles[0]
+    await update.message.reply_text(
+        f"💼 Wallet Balance\n\n"
+        f"👤 {profile['username']} ({profile['xid']})\n"
+        f"💰 Balance: ₹{float(profile['balance']):.2f}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+        ]])
+    )
 
 # =========================================================
 # 💰 TRANSACTION NOTIFICATIONS
@@ -716,12 +888,11 @@ async def send_transaction_notification_async(data: dict):
             f"💼 New Balance: ₹{balance}"
         )
 
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
-        ]])
-
         await _state["app"].bot.send_message(
-            chat_id=user_id, text=msg, parse_mode="HTML", reply_markup=keyboard
+            chat_id=user_id, text=msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💼 Open Wallet", web_app={"url": MINIAPP_URL})
+            ]])
         )
         return True
     except Exception as e:
@@ -774,28 +945,25 @@ def home():
         "service": "Xeo Wallet Bot",
         "bot_ready": bot_is_ready(),
         "active_sessions": len(_deposit_sessions),
+        "pending_transfers": len(_pending_transfers),
     })
 
 @app.route("/notify_transaction", methods=["POST"])
 def notify_transaction():
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
-
     data = request.json
     if not data:
         return jsonify({"error": "No data provided"}), 400
-
     required_fields = ["user_id", "type", "amount", "status"]
     missing = [f for f in required_fields if f not in data]
     if missing:
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
-
     Thread(target=send_transaction_notification, args=(data,), daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/test_email", methods=["GET"])
 def test_email():
-    """Test Gmail connection and fetch recent emails."""
     try:
         emails = fetch_recent_famapp_emails(since_minutes=60)
         results = []
@@ -819,43 +987,32 @@ def test_email():
 def admin_alert():
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
-
     data = request.json
     if not data or not data.get("message"):
         return jsonify({"error": "Missing message"}), 400
-
     Thread(target=send_admin_message, args=(data["message"],), daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/start_deposit_session", methods=["POST"])
 def start_deposit_session():
-    """
-    Called by frontend when user clicks 'I've Paid'.
-    Starts a 5-minute email watch session.
-    POST { request_id, user_id, xid, amount, telegram_id }
-    """
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
-
     data = request.json
     if not data:
         return jsonify({"error": "No data"}), 400
-
     required = ["request_id", "user_id", "xid", "amount"]
     missing = [f for f in required if f not in data]
     if missing:
         return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
-
     request_id = data["request_id"]
     _deposit_sessions[request_id] = {
         "user_id": data["user_id"],
         "xid": data["xid"],
         "amount": float(data["amount"]),
         "telegram_id": data.get("telegram_id"),
-        "expires_at": time.time() + 300,  # 5 minutes
+        "expires_at": time.time() + 300,
         "matched": False,
     }
-
     logger.info(f"[SESSION] Started deposit session {request_id} for ₹{data['amount']}")
     return jsonify({"ok": True, "expires_in": 300})
 
@@ -863,11 +1020,9 @@ def start_deposit_session():
 def check_id():
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
-
     data = request.json
     if not data or not data.get("user_id"):
         return jsonify({"error": "Missing user_id"}), 400
-
     cleanup_old_codes()
     code = secrets.token_urlsafe(16)
     _pending_connects[code] = {
@@ -875,7 +1030,6 @@ def check_id():
         "xid": data.get("xid", "User"),
         "created_at": time.time()
     }
-
     link = f"https://t.me/XeoWalletBot?start={code}"
     return jsonify({"ok": True, "link": link, "code": code})
 
@@ -883,27 +1037,22 @@ def check_id():
 def check_channels():
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
-
     data = request.json
     user_id = data.get("user_id")
     channels = data.get("channels")
-
     if not user_id or not channels:
         return jsonify({"error": "Missing user_id or channels"}), 400
-
     try:
         future = asyncio.run_coroutine_threadsafe(
             verify_user_channels(int(user_id), channels), _state["loop"]
         )
         not_joined, bot_missing = future.result(timeout=15)
-
         if bot_missing:
             return jsonify({
                 "ok": False, "bot_error": True,
                 "bot_missing_channels": bot_missing,
                 "message": "Bot is not admin in some channels"
             })
-
         return jsonify({"ok": True, "joined": len(not_joined) == 0, "missing_channels": not_joined})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -912,12 +1061,10 @@ def check_channels():
 def resolve_chat_id():
     if not wait_for_bot():
         return jsonify({"error": "Bot failed to start"}), 503
-
     data = request.json
     invite_link = data.get("invite_link")
     if not invite_link:
         return jsonify({"error": "Missing invite_link"}), 400
-
     try:
         future = asyncio.run_coroutine_threadsafe(
             get_chat_id_async(invite_link), _state["loop"]
@@ -937,7 +1084,9 @@ async def run_bot_async():
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("id", id_cmd))
     telegram_app.add_handler(CommandHandler("chatid", chatid_cmd))
-    telegram_app.add_handler(CallbackQueryHandler(handle_callback))  # Approve/Decline
+    telegram_app.add_handler(CommandHandler("send", send_cmd))
+    telegram_app.add_handler(CommandHandler("balance", balance_cmd))
+    telegram_app.add_handler(CallbackQueryHandler(handle_callback))
 
     await telegram_app.initialize()
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
@@ -1005,7 +1154,7 @@ def create_new_round():
 
 def resolve_round(round_id):
     result = random.choice(["big", "small"])
-    data = supabase_rpc("resolve_round", {"p_round_id": round_id, "p_result": result})
+    supabase_rpc("resolve_round", {"p_round_id": round_id, "p_result": result})
     return result
 
 def game_round_loop():
@@ -1020,13 +1169,10 @@ def game_round_loop():
             if not round_id:
                 time.sleep(3)
                 continue
-
             _round_state["current_round_id"] = round_id
             time.sleep(10)
-
             resolve_round(round_id)
             time.sleep(3)
-
         except Exception as e:
             logger.error(f"[GAME] Round loop error: {e}")
             time.sleep(3)
